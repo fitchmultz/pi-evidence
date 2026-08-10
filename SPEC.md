@@ -192,6 +192,16 @@ V1 targets supported Node.js LTS releases on macOS and Linux. It stores evidence
 only on the current machine and makes no durability promise beyond the local
 filesystem.
 
+## Future work
+
+> panel verdicts are role approvals until a durable, verifiable panel artifact
+> exists; modeling them as shell gates would be fake evidence.
+
+A panel lead can record the verdict with
+`evidence approve <sha> --as reviewer-panel` today.
+Durable panel artifacts and findings-diff optimization should be designed
+together after v1.
+
 ## Explicit non-goals for v1
 
 - Server or daemon
