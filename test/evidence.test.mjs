@@ -33,10 +33,10 @@ function git(root, ...args) {
   return result.stdout.trim();
 }
 
-function fixture(name, manifest) {
+function fixture(name, manifest, rootName = "repo") {
   const base = mkdtempSync(join(tmpdir(), "pi-evidence-test-"));
   roots.push(base);
-  const root = join(base, "repo");
+  const root = join(base, rootName);
   const home = join(base, "home");
   mkdirSync(root);
   mkdirSync(home);
@@ -216,6 +216,56 @@ test("timeout kills the full gate process group", () => {
   assert.equal(processIsRunning(childPid), false, `timed-out descendant ${childPid} is still alive`);
 });
 
+test("timeout returns when an escaped descendant holds output pipes", () => {
+  const candidate = fixture("escaped-timeout", {
+    gates: [{ id: "escape", cmd: `node escape.cjs "$HOME/escaped.pid"`, timeout: 1 }],
+    approvals: [],
+  });
+  writeFileSync(
+    join(candidate.root, "escape.cjs"),
+    [
+      `const { spawn } = require("node:child_process");`,
+      `const { writeFileSync } = require("node:fs");`,
+      `const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { detached: true, stdio: "inherit" });`,
+      `writeFileSync(process.argv[2], String(child.pid));`,
+      `child.unref();`,
+      `setInterval(() => {}, 1000);`,
+      "",
+    ].join("\n"),
+  );
+  git(candidate.root, "add", "escape.cjs");
+  git(candidate.root, "commit", "--amend", "--no-edit", "-q");
+  candidate.sha = git(candidate.root, "rev-parse", "HEAD");
+
+  const started = Date.now();
+  const run = evidence(candidate, "run");
+  const escapedPid = Number(readFileSync(join(candidate.home, "escaped.pid"), "utf8"));
+  try {
+    assert.equal(run.status, 1, run.stderr);
+    assert.ok(Date.now() - started < 5_000, "timed-out gate waited on escaped output pipes");
+    assert.equal(runs(candidate)[0].results[0].timedOut, true);
+  } finally {
+    try {
+      process.kill(escapedPid, "SIGKILL");
+    } catch {
+      // The escaped child may already have exited.
+    }
+  }
+});
+
+test("repository roots preserve trailing spaces", () => {
+  const candidate = fixture(
+    "space-root",
+    {
+      gates: [{ id: "ok", cmd: `node -e "process.exit(0)"`, timeout: 5 }],
+      approvals: [],
+    },
+    "repo ",
+  );
+  assert.equal(evidence(candidate, "run").status, 0);
+  assert.equal(evidence(candidate, "check", candidate.sha).status, 0);
+});
+
 test("run refuses dirty worktrees and invalid manifests", () => {
   const candidate = fixture("refusal", {
     gates: [{ id: "ok", cmd: `node -e "process.exit(0)"`, timeout: 5 }],
@@ -286,11 +336,15 @@ test("monotonic append order makes a later failure authoritative", () => {
 
 test("corrupt completed bundle data fails closed as stale", () => {
   const candidate = fixture("corrupt", {
-    gates: [{ id: "ok", cmd: `node -e "process.exit(0)"`, timeout: 5 }],
+    gates: [{ id: "ok", cmd: `node -e "process.stdout.write('ran')"`, timeout: 5 }],
     approvals: [],
   });
   assert.equal(evidence(candidate, "run").status, 0);
   writeFileSync(join(bundle(candidate), "runs", "corrupt.json"), "not-json\n");
+  const rerun = evidence(candidate, "run");
+  assert.equal(rerun.status, 2);
+  assert.equal(rerun.stdout, "");
+  assert.doesNotMatch(rerun.stderr, /==> ok/);
 
   const check = evidence(candidate, "check", candidate.sha);
   assert.equal(check.status, 2);

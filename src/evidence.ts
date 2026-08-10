@@ -171,7 +171,7 @@ function git(cwd: string | undefined, args: string[]): string {
   if (result.status !== 0) {
     throw new CliError((result.stderr || result.stdout || `git ${args[0]} failed`).trim());
   }
-  return result.stdout.trimEnd();
+  return result.stdout.endsWith("\n") ? result.stdout.slice(0, -1) : result.stdout;
 }
 
 function repositoryRoot(): string {
@@ -267,7 +267,6 @@ async function runGate(gate: Gate, root: string): Promise<GateResult> {
   const stderr: Buffer[] = [];
   let timedOut = false;
   let spawnError: string | null = null;
-  let termination: Promise<string | null> | undefined;
   let child: ChildProcess;
 
   try {
@@ -314,19 +313,41 @@ async function runGate(gate: Gate, root: string): Promise<GateResult> {
   process.once("SIGINT", onInterrupt);
   process.once("SIGTERM", onTerminate);
 
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    termination = terminateTimedOutGroup(child);
-  }, gate.timeout * 1000);
-
-  const [exitCode, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => {
+  let observedExit: [number | null, NodeJS.Signals | null] = [null, null];
+  child.once("exit", (code, exitSignal) => {
+    observedExit = [code, exitSignal];
+  });
+  const closed = new Promise<[number | null, NodeJS.Signals | null]>((resolve) => {
     child.once("close", (code, closeSignal) => resolve([code, closeSignal]));
   });
-  clearTimeout(timeout);
-  if (termination) {
-    const terminationError = await termination;
+  let timeout: NodeJS.Timeout | undefined;
+  const terminated = new Promise<string | null>((resolve) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      void terminateTimedOutGroup(child).then(resolve, (error) => resolve(message(error)));
+    }, gate.timeout * 1000);
+  });
+  const outcome = await Promise.race([
+    closed.then((result) => ({ kind: "closed" as const, result })),
+    terminated.then((error) => ({ kind: "timeout" as const, error })),
+  ]);
+  if (timeout) clearTimeout(timeout);
+
+  let exit: [number | null, NodeJS.Signals | null];
+  if (outcome.kind === "closed" && !timedOut) {
+    exit = outcome.result;
+  } else {
+    const terminationError = outcome.kind === "timeout" ? outcome.error : await terminated;
     if (terminationError) spawnError ??= terminationError;
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    const closedAfterTimeout =
+      outcome.kind === "closed"
+        ? outcome.result
+        : await Promise.race([closed, wait(100).then(() => null)]);
+    exit = closedAfterTimeout ?? observedExit;
   }
+  const [exitCode, signal] = exit;
   process.removeListener("SIGINT", onInterrupt);
   process.removeListener("SIGTERM", onTerminate);
 
@@ -410,6 +431,7 @@ async function run(): Promise<number> {
   if (!clean(root)) throw new CliError("worktree must be clean before running evidence");
 
   const directory = await ensureBundle(manifest, sha);
+  await nextSequence(directory);
   const started = Date.now();
   const results: GateResult[] = [];
   for (const gate of manifest.gates) {

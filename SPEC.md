@@ -75,8 +75,10 @@ platform shell and inherit the caller's environment. The runner mirrors output
 to the terminal while capturing stdout and stderr separately as UTF-8 text.
 
 A timeout sends `SIGTERM` to the command's process group, escalates to `SIGKILL`
-after 500 ms, awaits termination, and records a failed gate. Spawn errors,
-signals, timeouts, and non-zero exits are failures. All gates are attempted so a
+after 500 ms, awaits that process group, and records a failed gate. The runner
+closes capture pipes after the termination deadline so a descendant that moved
+to another process group cannot hold the run open. Spawn errors, signals,
+timeouts, and non-zero exits are failures. All gates are attempted so a
 completed run contains one result for every required gate.
 
 Each result records the exact gate definition and outcome:
