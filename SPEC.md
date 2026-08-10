@@ -128,8 +128,10 @@ repository HEAD. It prints exactly one status line beginning with:
   candidate manifest or bundle is absent/conflicting/corrupt, or no completed
   exact-manifest run contains every required gate.
 
-A present failed gate is red; a required gate with no result is stale. Runs get
-an atomically reserved, increasing sequence at publication time. Older failed
+A present failed gate is red; a required gate with no result is stale. Immediately
+before printing `GREEN` or `RED`, `check` revalidates HEAD, cleanliness, and HEAD
+again; a concurrent source change therefore becomes `STALE`. Runs get an
+atomically reserved, increasing sequence at publication time. Older failed
 runs remain in the bundle but do not override the highest-sequence completed
 exact-manifest run; wall-clock timestamps never decide precedence.
 

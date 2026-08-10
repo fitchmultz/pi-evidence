@@ -646,12 +646,29 @@ function printStatus(status: Status, sha: string, detail: string): number {
   return status === "GREEN" ? 0 : status === "RED" ? 1 : 2;
 }
 
+function sourceStaleness(root: string, sha: string): string | null {
+  const before = head(root);
+  if (before !== sha) return `HEAD is ${before}`;
+  if (!clean(root)) return "worktree is dirty";
+  const after = head(root);
+  return after === sha ? null : `HEAD is ${after}`;
+}
+
+function printCurrentStatus(
+  root: string,
+  sha: string,
+  status: Exclude<Status, "STALE">,
+  detail: string,
+): number {
+  const stale = sourceStaleness(root, sha);
+  return stale ? printStatus("STALE", sha, stale) : printStatus(status, sha, detail);
+}
+
 async function check(sha: string): Promise<number> {
   try {
     const root = repositoryRoot();
-    const current = head(root);
-    if (current !== sha) return printStatus("STALE", sha, `HEAD is ${current}`);
-    if (!clean(root)) return printStatus("STALE", sha, "worktree is dirty");
+    const initialStale = sourceStaleness(root, sha);
+    if (initialStale) return printStatus("STALE", sha, initialStale);
     const manifest = committedManifest(root, sha);
     const directory = candidateDir(manifest, sha);
     const stored = parseManifest(
@@ -664,10 +681,14 @@ async function check(sha: string): Promise<number> {
     const record = await latestRun(directory, manifest, sha);
     if (!record) return printStatus("STALE", sha, "required gate evidence is missing");
     const approved = new Set((await approvals(directory, manifest, sha)).map((entry) => entry.role));
-    if (record.status === "failed") return printStatus("RED", sha, `run ${record.runId} failed`);
+    if (record.status === "failed") {
+      return printCurrentStatus(root, sha, "RED", `run ${record.runId} failed`);
+    }
     const missing = manifest.approvals.filter((role) => !approved.has(role));
-    if (missing.length > 0) return printStatus("RED", sha, `missing approvals: ${missing.join(",")}`);
-    return printStatus("GREEN", sha, `run ${record.runId} passed`);
+    if (missing.length > 0) {
+      return printCurrentStatus(root, sha, "RED", `missing approvals: ${missing.join(",")}`);
+    }
+    return printCurrentStatus(root, sha, "GREEN", `run ${record.runId} passed`);
   } catch (error) {
     return printStatus("STALE", sha, message(error));
   }

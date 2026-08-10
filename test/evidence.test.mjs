@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -60,6 +62,22 @@ function evidenceWithEnv(fixture, extraEnv, ...args) {
 
 function evidence(fixture, ...args) {
   return evidenceWithEnv(fixture, {}, ...args);
+}
+
+function evidenceAsync(fixture, extraEnv, ...args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, ...args], {
+      cwd: fixture.root,
+      env: { ...process.env, HOME: fixture.home, ...extraEnv },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+    child.once("error", reject);
+    child.once("close", (status, signal) => resolve({ status, signal, stdout, stderr }));
+  });
 }
 
 function bundle(fixture, sha = fixture.sha) {
@@ -161,6 +179,65 @@ test("run, approve, check, append, and stale lifecycle", () => {
   git(candidate.root, "commit", "-qm", "move head");
   result = evidence(candidate, "check", candidate.sha);
   assert.equal(result.status, 2);
+  assert.match(result.stdout, /^STALE .*HEAD is /);
+});
+
+test("check revalidates HEAD immediately before its verdict", async () => {
+  const candidate = fixture("check-race", {
+    gates: [{ id: "ok", cmd: `node -e "process.exit(0)"`, timeout: 5 }],
+    approvals: [],
+  });
+  assert.equal(evidence(candidate, "run").status, 0);
+  writeFileSync(join(candidate.root, "tracked.txt"), "new head\n");
+  git(candidate.root, "add", "tracked.txt");
+  git(candidate.root, "commit", "-qm", "move head");
+  const newSha = git(candidate.root, "rev-parse", "HEAD");
+  git(candidate.root, "checkout", "--detach", "-q", candidate.sha);
+
+  const bin = join(candidate.home, "bin");
+  const marker = join(candidate.home, "initial-source-check-done");
+  const counter = join(candidate.home, "head-count");
+  const realGit = exec("sh", ["-c", "command -v git"]).stdout.trim();
+  mkdirSync(bin);
+  const wrapper = join(bin, "git");
+  writeFileSync(
+    wrapper,
+    [
+      "#!/bin/sh",
+      `real_git=${JSON.stringify(realGit)}`,
+      '"$real_git" "$@"',
+      "status=$?",
+      'if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then',
+      `  count_file=${JSON.stringify(counter)}`,
+      "  count=0",
+      '  [ ! -f "$count_file" ] || count=$(cat "$count_file")',
+      "  count=$((count + 1))",
+      '  echo "$count" > "$count_file"',
+      "  if [ \"$count\" -eq 2 ]; then",
+      `    : > ${JSON.stringify(marker)}`,
+      "    sleep 1",
+      "  fi",
+      "fi",
+      'exit "$status"',
+      "",
+    ].join("\n"),
+  );
+  chmodSync(wrapper, 0o755);
+
+  const pending = evidenceAsync(
+    candidate,
+    { PATH: `${bin}:${process.env.PATH ?? ""}` },
+    "check",
+    candidate.sha,
+  );
+  for (let attempt = 0; attempt < 200 && !existsSync(marker); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(existsSync(marker), true, "check did not reach its initial source validation");
+  git(candidate.root, "checkout", "--detach", "-q", newSha);
+
+  const result = await pending;
+  assert.equal(result.status, 2, result.stdout + result.stderr);
   assert.match(result.stdout, /^STALE .*HEAD is /);
 });
 
