@@ -74,7 +74,8 @@ with the repository root as the working directory. Commands execute through the
 platform shell and inherit the caller's environment. The runner mirrors output
 to the terminal while capturing stdout and stderr separately as UTF-8 text.
 
-A timeout terminates the command and records a failed gate. Spawn errors,
+A timeout sends `SIGTERM` to the command's process group, escalates to `SIGKILL`
+after 500 ms, awaits termination, and records a failed gate. Spawn errors,
 signals, timeouts, and non-zero exits are failures. All gates are attempted so a
 completed run contains one result for every required gate.
 
@@ -90,38 +91,41 @@ Each result records the exact gate definition and outcome:
   "exitCode": 0,
   "signal": null,
   "timedOut": false,
+  "spawnError": null,
   "stdout": "...",
   "stderr": "..."
 }
 ```
 
-A run record also contains format version, repository, resolved SHA, normalized
-manifest SHA-256 digest, an exact `gateDefinitions` snapshot, run ID, start/end
-times, tool/Node/platform versions, final source-state check, and overall
-`passed` or `failed` status. This makes each run self-describing when a later
-commit changes the manifest.
+A run record also contains `type: "run"`, format version, repository, resolved
+SHA, normalized manifest SHA-256 digest, an exact `gateDefinitions` snapshot,
+monotonic append `sequence`, run ID, start/end times, tool/Node/platform
+versions, final source-state check, nullable `runnerError`, and overall `passed`
+or `failed` status. This makes each run self-describing when a later commit
+changes the manifest.
 
 Exit status is `0` when the run passed, `1` when a gate or final source-state
-check failed, and `2` for usage, manifest, Git, bundle, or other runner errors.
-No partial runner error is reported as passing evidence.
+check failed, and `2` for manifest, Git, bundle, or other runner errors. Invalid
+CLI usage exits `64`. No partial runner error is reported as passing evidence.
 
 ### `evidence check <sha>`
 
 Loads the candidate manifest committed at `<sha>`, its local bundle, and current
 repository HEAD. It prints exactly one status line beginning with:
 
-- `GREEN`: HEAD equals `<sha>`, the newest completed run for the exact manifest
-  contains every required gate and passed, and every required approval role has
-  at least one record.
-- `RED`: HEAD equals `<sha>` and the newest exact-manifest run is complete but
-  failed, or required approvals are absent.
-- `STALE`: current HEAD differs from `<sha>`, the candidate manifest or bundle
-  is absent/conflicting/corrupt, or no completed exact-manifest run contains
-  every required gate.
+- `GREEN`: HEAD equals `<sha>`, the worktree is clean, the highest-sequence
+  completed run for the exact manifest contains every required gate and passed,
+  and every required approval role has at least one record.
+- `RED`: HEAD equals `<sha>` and the highest-sequence exact-manifest run is
+  complete but failed, or required approvals are absent.
+- `STALE`: current HEAD differs from `<sha>`, the worktree is dirty, the
+  candidate manifest or bundle is absent/conflicting/corrupt, or no completed
+  exact-manifest run contains every required gate.
 
-A present failed gate is red; a required gate with no result is stale. Older
-failed runs remain in the bundle but do not override the newest completed
-exact-manifest run.
+A present failed gate is red; a required gate with no result is stale. Runs get
+an atomically reserved, increasing sequence at publication time. Older failed
+runs remain in the bundle but do not override the highest-sequence completed
+exact-manifest run; wall-clock timestamps never decide precedence.
 
 The machine-readable status contract is:
 
@@ -167,14 +171,14 @@ Bundles live under the user's home directory:
 ~/.pi/evidence/<repo>/<sha>/
   manifest.json
   runs/
-    <timestamp>-<random>.json
+    <12-digit-sequence>.json
   approvals.jsonl
 ```
 
 `<repo>` preserves its validated path segments. `manifest.json` is created once
-and must match the manifest committed at the candidate SHA. Every run gets a
-unique file created without replacement. Each approval is one line appended to
-`approvals.jsonl`.
+and must match the manifest committed at the candidate SHA. Every run gets the
+next available sequence and is atomically hard-linked into place without
+replacement. Each approval is one line appended to `approvals.jsonl`.
 
 The CLI never rewrites or deletes a completed record. A process interrupted
 before publishing a complete run may leave a temporary file; checks ignore
@@ -186,11 +190,14 @@ who can edit the local filesystem can alter evidence.
 Gate commands are trusted repository configuration and can execute arbitrary
 code with the caller's permissions. Captured output may contain secrets; the
 runner neither redacts nor uploads it. The caller owns command safety and output
-hygiene.
+hygiene. Output capture and bundle retention are unbounded in v1, so a runaway
+gate can exhaust memory or disk.
 
 V1 targets supported Node.js LTS releases on macOS and Linux. It stores evidence
 only on the current machine and makes no durability promise beyond the local
-filesystem.
+filesystem. A corrupt candidate bundle remains `STALE`; the CLI does not repair
+or delete it. An operator may archive the entire candidate directory and rerun
+the candidate.
 
 ## Future work
 

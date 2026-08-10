@@ -41,15 +41,16 @@ evidence check "$(git rev-parse HEAD)"
 ```
 
 `run` refuses a dirty worktree. Bundles are appended under
-`~/.pi/evidence/<repo>/<sha>/`.
+`~/.pi/evidence/<repo>/<sha>/`. `check` also reports `STALE` while the worktree
+is dirty, so a release script cannot ship untested local changes.
 
 `check` prints one status line and returns:
 
 | Status | Exit code | Meaning |
 | --- | ---: | --- |
-| `GREEN` | 0 | Exact HEAD has a passing complete run and all approvals. |
-| `RED` | 1 | The current complete run failed or approvals are missing. |
-| `STALE` | 2 | HEAD moved or exact required evidence is absent/conflicting. |
+| `GREEN` | 0 | Clean exact HEAD has a passing complete run and all approvals. |
+| `RED` | 1 | The latest complete run failed or approvals are missing. |
+| `STALE` | 2 | HEAD moved, the tree is dirty, or exact evidence is absent/conflicting. |
 
 See [SPEC.md](SPEC.md) for the full v1 contract and explicit non-goals.
 

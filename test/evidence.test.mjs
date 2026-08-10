@@ -51,15 +51,33 @@ function fixture(name, manifest) {
   return { root, home, sha, repo: `test/${name}` };
 }
 
-function evidence(fixture, ...args) {
+function evidenceWithEnv(fixture, extraEnv, ...args) {
   return exec(process.execPath, [cli, ...args], {
     cwd: fixture.root,
-    env: { ...process.env, HOME: fixture.home },
+    env: { ...process.env, HOME: fixture.home, ...extraEnv },
   });
+}
+
+function evidence(fixture, ...args) {
+  return evidenceWithEnv(fixture, {}, ...args);
 }
 
 function bundle(fixture, sha = fixture.sha) {
   return join(fixture.home, ".pi", "evidence", ...fixture.repo.split("/"), sha);
+}
+
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+  if (process.platform === "linux") {
+    const state = /\) ([A-Z]) /.exec(readFileSync(`/proc/${pid}/stat`, "utf8"))?.[1];
+    if (state === "Z") return false;
+  }
+  return true;
 }
 
 function runs(fixture) {
@@ -93,6 +111,7 @@ test("run, approve, check, append, and stale lifecycle", () => {
 
   const [record] = runs(candidate);
   assert.equal(record.sha, candidate.sha);
+  assert.equal(record.sequence, 1);
   assert.match(record.manifestDigest, /^sha256:[0-9a-f]{64}$/);
   assert.deepEqual(record.gateDefinitions, [
     {
@@ -123,9 +142,19 @@ test("run, approve, check, append, and stale lifecycle", () => {
   assert.match(result.stdout, /^GREEN /);
   assert.equal(readFileSync(join(bundle(candidate), "approvals.jsonl"), "utf8").trim().split("\n").length, 2);
 
+  writeFileSync(join(candidate.root, "untracked.txt"), "dirty\n");
+  result = evidence(candidate, "check", candidate.sha);
+  assert.equal(result.status, 2);
+  assert.match(result.stdout, /^STALE .*worktree is dirty/);
+  rmSync(join(candidate.root, "untracked.txt"));
+
   result = evidence(candidate, "run");
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(runs(candidate).length, 2);
+  assert.deepEqual(
+    readdirSync(join(bundle(candidate), "runs")).filter((name) => name.endsWith(".json")).sort(),
+    ["000000000001.json", "000000000002.json"],
+  );
+  assert.deepEqual(runs(candidate).map((entry) => entry.sequence), [1, 2]);
 
   writeFileSync(join(candidate.root, "tracked.txt"), "new head\n");
   git(candidate.root, "add", "tracked.txt");
@@ -157,17 +186,34 @@ test("all gates run and a failed gate makes evidence red", () => {
   assert.match(check.stdout, /^RED /);
 });
 
-test("timeout kills a gate and records the timeout", () => {
+test("timeout kills the full gate process group", () => {
   const candidate = fixture("timeout", {
-    gates: [{ id: "slow", cmd: `node -e "setTimeout(() => {}, 5000)"`, timeout: 1 }],
+    gates: [{ id: "slow", cmd: `node stubborn.cjs "$HOME/stubborn.pid"`, timeout: 1 }],
     approvals: [],
   });
+  writeFileSync(
+    join(candidate.root, "stubborn.cjs"),
+    [
+      `const { spawn } = require("node:child_process");`,
+      `const { writeFileSync } = require("node:fs");`,
+      `const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });`,
+      `writeFileSync(process.argv[2], String(child.pid));`,
+      `process.on("SIGTERM", () => {});`,
+      `setInterval(() => {}, 1000);`,
+      "",
+    ].join("\n"),
+  );
+  git(candidate.root, "add", "stubborn.cjs");
+  git(candidate.root, "commit", "--amend", "--no-edit", "-q");
+  candidate.sha = git(candidate.root, "rev-parse", "HEAD");
 
   const run = evidence(candidate, "run");
   assert.equal(run.status, 1, run.stderr);
   const [record] = runs(candidate);
   assert.equal(record.results[0].timedOut, true);
   assert.equal(record.status, "failed");
+  const childPid = Number(readFileSync(join(candidate.home, "stubborn.pid"), "utf8"));
+  assert.equal(processIsRunning(childPid), false, `timed-out descendant ${childPid} is still alive`);
 });
 
 test("run refuses dirty worktrees and invalid manifests", () => {
@@ -209,6 +255,30 @@ test("a gate that changes tracked source makes the run red", () => {
   assert.equal(record.source.cleanAfter, false);
   assert.equal(record.status, "failed");
 
+  const check = evidence(candidate, "check", candidate.sha);
+  assert.equal(check.status, 2);
+  assert.match(check.stdout, /^STALE .*worktree is dirty/);
+});
+
+test("monotonic append order makes a later failure authoritative", () => {
+  const candidate = fixture("ordering", {
+    gates: [
+      {
+        id: "conditional",
+        cmd: `node -e "process.exit(process.env.EVIDENCE_TEST_FAIL ? 9 : 0)"`,
+        timeout: 5,
+      },
+    ],
+    approvals: [],
+  });
+  assert.equal(evidence(candidate, "run").status, 0);
+  const firstPath = join(bundle(candidate), "runs", "000000000001.json");
+  const first = JSON.parse(readFileSync(firstPath, "utf8"));
+  first.completedAt = "2999-01-01T00:00:00.000Z";
+  writeFileSync(firstPath, `${JSON.stringify(first, null, 2)}\n`);
+
+  assert.equal(evidenceWithEnv(candidate, { EVIDENCE_TEST_FAIL: "1" }, "run").status, 1);
+  assert.deepEqual(runs(candidate).map((entry) => entry.sequence), [1, 2]);
   const check = evidence(candidate, "check", candidate.sha);
   assert.equal(check.status, 1);
   assert.match(check.stdout, /^RED /);

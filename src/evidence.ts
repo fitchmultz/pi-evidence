@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { appendFile, link, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +11,7 @@ const FORMAT_VERSION = 1;
 const MAX_TIMEOUT_SECONDS = 2_147_483;
 const NAME = /^[A-Za-z0-9._-]+$/;
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const RUN_FILE = /^(\d{12})\.json$/;
 
 type Status = "GREEN" | "RED" | "STALE";
 type Gate = { id: string; cmd: string; timeout: number };
@@ -32,6 +33,7 @@ type RunRecord = {
   sha: string;
   manifestDigest: string;
   gateDefinitions: Gate[];
+  sequence: number;
   runId: string;
   startedAt: string;
   completedAt: string;
@@ -119,10 +121,7 @@ function parseManifest(text: string, label: string): Manifest {
 
   if (typeof value.repo !== "string") throw new CliError(`${label}.repo must be a string`);
   const segments = value.repo.split("/");
-  if (
-    segments.length === 0 ||
-    segments.some((segment) => !NAME.test(segment) || segment === "." || segment === "..")
-  ) {
+  if (segments.some((segment) => !NAME.test(segment) || segment === "." || segment === "..")) {
     throw new CliError(`${label}.repo is invalid`);
   }
   if (!Array.isArray(value.gates) || value.gates.length === 0) {
@@ -176,11 +175,11 @@ function git(cwd: string | undefined, args: string[]): string {
 }
 
 function repositoryRoot(): string {
-  return git(undefined, ["rev-parse", "--show-toplevel"]).trim();
+  return git(undefined, ["rev-parse", "--show-toplevel"]);
 }
 
 function head(root: string): string {
-  return git(root, ["rev-parse", "HEAD"]).trim();
+  return git(root, ["rev-parse", "HEAD"]);
 }
 
 function clean(root: string): boolean {
@@ -233,6 +232,34 @@ function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
+function groupAlive(child: ChildProcess): boolean {
+  if (!child.pid) return false;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return isErrno(error, "EPERM");
+  }
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function terminateTimedOutGroup(child: ChildProcess): Promise<string | null> {
+  killGroup(child, "SIGTERM");
+  for (let elapsed = 0; elapsed < 500; elapsed += 25) {
+    await wait(25);
+    if (!groupAlive(child)) return null;
+  }
+  killGroup(child, "SIGKILL");
+  for (let elapsed = 0; elapsed < 500; elapsed += 25) {
+    await wait(25);
+    if (!groupAlive(child)) return null;
+  }
+  return "timed-out process group did not terminate";
+}
+
 async function runGate(gate: Gate, root: string): Promise<GateResult> {
   const started = Date.now();
   const startedAt = new Date(started).toISOString();
@@ -240,6 +267,7 @@ async function runGate(gate: Gate, root: string): Promise<GateResult> {
   const stderr: Buffer[] = [];
   let timedOut = false;
   let spawnError: string | null = null;
+  let termination: Promise<string | null> | undefined;
   let child: ChildProcess;
 
   try {
@@ -247,7 +275,6 @@ async function runGate(gate: Gate, root: string): Promise<GateResult> {
       cwd: root,
       shell: true,
       detached: true,
-      env: process.env,
       stdio: ["inherit", "pipe", "pipe"],
     });
   } catch (error) {
@@ -289,14 +316,17 @@ async function runGate(gate: Gate, root: string): Promise<GateResult> {
 
   const timeout = setTimeout(() => {
     timedOut = true;
-    killGroup(child, "SIGTERM");
-    setTimeout(() => killGroup(child, "SIGKILL"), 500).unref();
+    termination = terminateTimedOutGroup(child);
   }, gate.timeout * 1000);
 
   const [exitCode, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => {
     child.once("close", (code, closeSignal) => resolve([code, closeSignal]));
   });
   clearTimeout(timeout);
+  if (termination) {
+    const terminationError = await termination;
+    if (terminationError) spawnError ??= terminationError;
+  }
   process.removeListener("SIGINT", onInterrupt);
   process.removeListener("SIGTERM", onTerminate);
 
@@ -322,17 +352,50 @@ function gatePassed(result: GateResult): boolean {
   );
 }
 
-async function publishRun(directory: string, record: RunRecord): Promise<void> {
-  const stem = `${record.completedAt.replace(/[:.]/g, "-")}-${record.runId}`;
-  const temporary = join(directory, "runs", `.${stem}.tmp`);
-  const destination = join(directory, "runs", `${stem}.json`);
-  await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-  try {
-    await rename(temporary, destination);
-  } catch (error) {
-    await unlink(temporary).catch(() => undefined);
-    throw error;
+function sequenceFromName(name: string): number {
+  const match = RUN_FILE.exec(name);
+  const sequence = Number(match?.[1]);
+  if (!Number.isSafeInteger(sequence) || sequence < 1) {
+    throw new CliError(`invalid run filename: ${name}`);
   }
+  return sequence;
+}
+
+async function nextSequence(directory: string): Promise<number> {
+  let latest = 0;
+  for (const entry of await readdir(join(directory, "runs"), { withFileTypes: true })) {
+    if (!entry.name.endsWith(".json")) continue;
+    if (!entry.isFile()) throw new CliError(`invalid run file: ${entry.name}`);
+    latest = Math.max(latest, sequenceFromName(entry.name));
+  }
+  if (latest >= 999_999_999_999) throw new CliError("run sequence is exhausted");
+  return latest + 1;
+}
+
+async function publishRun(
+  directory: string,
+  pending: Omit<RunRecord, "sequence">,
+): Promise<RunRecord> {
+  let sequence = await nextSequence(directory);
+  while (sequence <= 999_999_999_999) {
+    const record: RunRecord = { ...pending, sequence };
+    const temporary = join(directory, "runs", `.${record.runId}-${randomUUID()}.tmp`);
+    const destination = join(directory, "runs", `${String(sequence).padStart(12, "0")}.json`);
+    await writeFile(temporary, `${JSON.stringify(record, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    try {
+      await link(temporary, destination);
+      await unlink(temporary).catch(() => undefined);
+      return record;
+    } catch (error) {
+      await unlink(temporary).catch(() => undefined);
+      if (isErrno(error, "EEXIST")) {
+        sequence += 1;
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new CliError("run sequence is exhausted");
 }
 
 async function run(): Promise<number> {
@@ -370,7 +433,7 @@ async function run(): Promise<number> {
     cleanAfter === true &&
     runnerError === null;
   const completedAt = new Date().toISOString();
-  const record: RunRecord = {
+  const pending: Omit<RunRecord, "sequence"> = {
     version: FORMAT_VERSION,
     type: "run",
     repo: manifest.repo,
@@ -394,19 +457,20 @@ async function run(): Promise<number> {
     status: passed ? "passed" : "failed",
     runnerError,
   };
-  await publishRun(directory, record);
+  const record = await publishRun(directory, pending);
   console.error(`${passed ? "PASS" : "FAIL"} ${sha} (${record.runId})`);
   if (runnerError) return 2;
   return passed ? 0 : 1;
 }
 
-function parseRun(value: unknown, manifest: Manifest, sha: string): RunRecord | null {
+function parseRun(value: unknown, manifest: Manifest, sha: string, sequence: number): RunRecord {
   if (!isObject(value) || value.version !== FORMAT_VERSION || value.type !== "run") {
     throw new CliError("bundle contains an invalid run record");
   }
   if (
     value.repo !== manifest.repo ||
     value.sha !== sha ||
+    value.sequence !== sequence ||
     value.manifestDigest !== digest(manifest) ||
     JSON.stringify(value.gateDefinitions) !== JSON.stringify(manifest.gates)
   ) {
@@ -470,22 +534,21 @@ function parseRun(value: unknown, manifest: Manifest, sha: string): RunRecord | 
 }
 
 async function latestRun(directory: string, manifest: Manifest, sha: string): Promise<RunRecord | null> {
-  const files = (await readdir(join(directory, "runs"), { withFileTypes: true }))
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-    .map((entry) => entry.name);
-  const runs: RunRecord[] = [];
-  for (const file of files) {
+  let latest: RunRecord | null = null;
+  for (const entry of await readdir(join(directory, "runs"), { withFileTypes: true })) {
+    if (!entry.name.endsWith(".json")) continue;
+    if (!entry.isFile()) throw new CliError(`invalid run file: ${entry.name}`);
+    const sequence = sequenceFromName(entry.name);
     let value: unknown;
     try {
-      value = JSON.parse(await readFile(join(directory, "runs", file), "utf8"));
+      value = JSON.parse(await readFile(join(directory, "runs", entry.name), "utf8"));
     } catch (error) {
-      throw new CliError(`cannot read run ${file}: ${message(error)}`);
+      throw new CliError(`cannot read run ${entry.name}: ${message(error)}`);
     }
-    const record = parseRun(value, manifest, sha);
-    if (record) runs.push(record);
+    const record = parseRun(value, manifest, sha, sequence);
+    if (!latest || record.sequence > latest.sequence) latest = record;
   }
-  runs.sort((a, b) => Date.parse(b.completedAt) - Date.parse(a.completedAt));
-  return runs[0] ?? null;
+  return latest;
 }
 
 function parseApproval(value: unknown, manifest: Manifest, sha: string): Approval {
@@ -540,6 +603,7 @@ async function check(sha: string): Promise<number> {
     const root = repositoryRoot();
     const current = head(root);
     if (current !== sha) return printStatus("STALE", sha, `HEAD is ${current}`);
+    if (!clean(root)) return printStatus("STALE", sha, "worktree is dirty");
     const manifest = committedManifest(root, sha);
     const directory = candidateDir(manifest, sha);
     const stored = parseManifest(
