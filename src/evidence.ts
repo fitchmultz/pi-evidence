@@ -2,6 +2,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { appendFile, link, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -236,17 +237,32 @@ function groupAlive(child: ChildProcess): boolean {
   if (!child.pid) return false;
   try {
     process.kill(-child.pid, 0);
-    return true;
   } catch (error) {
     return isErrno(error, "EPERM");
   }
+  if (process.platform !== "linux") return true;
+
+  let matched = false;
+  for (const entry of readdirSync("/proc", { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    try {
+      const stat = readFileSync(`/proc/${entry.name}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+      if (Number(fields[2]) !== child.pid) continue;
+      matched = true;
+      if (fields[0] !== "Z") return true;
+    } catch {
+      // Processes may exit while /proc is scanned.
+    }
+  }
+  return !matched;
 }
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function terminateTimedOutGroup(child: ChildProcess): Promise<string | null> {
+async function terminateGroup(child: ChildProcess): Promise<string | null> {
   killGroup(child, "SIGTERM");
   for (let elapsed = 0; elapsed < 500; elapsed += 25) {
     await wait(25);
@@ -257,7 +273,7 @@ async function terminateTimedOutGroup(child: ChildProcess): Promise<string | nul
     await wait(25);
     if (!groupAlive(child)) return null;
   }
-  return "timed-out process group did not terminate";
+  return "process group did not terminate";
 }
 
 async function runGate(gate: Gate, root: string): Promise<GateResult> {
@@ -313,39 +329,49 @@ async function runGate(gate: Gate, root: string): Promise<GateResult> {
   process.once("SIGINT", onInterrupt);
   process.once("SIGTERM", onTerminate);
 
-  let observedExit: [number | null, NodeJS.Signals | null] = [null, null];
-  child.once("exit", (code, exitSignal) => {
-    observedExit = [code, exitSignal];
+  const exited = new Promise<[number | null, NodeJS.Signals | null]>((resolve) => {
+    let resolved = false;
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (resolved) return;
+      resolved = true;
+      resolve([code, signal]);
+    };
+    child.once("exit", finish);
+    child.once("close", finish);
   });
-  const closed = new Promise<[number | null, NodeJS.Signals | null]>((resolve) => {
-    child.once("close", (code, closeSignal) => resolve([code, closeSignal]));
-  });
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
   let timeout: NodeJS.Timeout | undefined;
   const terminated = new Promise<string | null>((resolve) => {
     timeout = setTimeout(() => {
       timedOut = true;
-      void terminateTimedOutGroup(child).then(resolve, (error) => resolve(message(error)));
+      void terminateGroup(child).then(resolve, (error) => resolve(message(error)));
     }, gate.timeout * 1000);
   });
   const outcome = await Promise.race([
-    closed.then((result) => ({ kind: "closed" as const, result })),
+    exited.then((result) => ({ kind: "exit" as const, result })),
     terminated.then((error) => ({ kind: "timeout" as const, error })),
   ]);
   if (timeout) clearTimeout(timeout);
 
   let exit: [number | null, NodeJS.Signals | null];
-  if (outcome.kind === "closed" && !timedOut) {
+  if (outcome.kind === "exit" && !timedOut) {
     exit = outcome.result;
+    if (groupAlive(child)) {
+      const cleanupError = await terminateGroup(child);
+      if (cleanupError) spawnError ??= cleanupError;
+    }
   } else {
     const terminationError = outcome.kind === "timeout" ? outcome.error : await terminated;
     if (terminationError) spawnError ??= terminationError;
+    exit =
+      outcome.kind === "exit"
+        ? outcome.result
+        : (await Promise.race([exited, wait(100).then(() => null)])) ?? [null, null];
+  }
+  const drained = await Promise.race([closed.then(() => true), wait(100).then(() => false)]);
+  if (!drained) {
     child.stdout?.destroy();
     child.stderr?.destroy();
-    const closedAfterTimeout =
-      outcome.kind === "closed"
-        ? outcome.result
-        : await Promise.race([closed, wait(100).then(() => null)]);
-    exit = closedAfterTimeout ?? observedExit;
   }
   const [exitCode, signal] = exit;
   process.removeListener("SIGINT", onInterrupt);
@@ -431,7 +457,7 @@ async function run(): Promise<number> {
   if (!clean(root)) throw new CliError("worktree must be clean before running evidence");
 
   const directory = await ensureBundle(manifest, sha);
-  await nextSequence(directory);
+  await latestRun(directory, manifest, sha);
   const started = Date.now();
   const results: GateResult[] = [];
   for (const gate of manifest.gates) {

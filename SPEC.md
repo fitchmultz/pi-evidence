@@ -73,6 +73,10 @@ Resolves current HEAD, then runs manifest gates sequentially in manifest order,
 with the repository root as the working directory. Commands execute through the
 platform shell and inherit the caller's environment. The runner mirrors output
 to the terminal while capturing stdout and stderr separately as UTF-8 text.
+Gate completion follows the shell process exit, not EOF from background
+processes that inherited its pipes. The runner gives output 100 ms to drain,
+closes lingering capture pipes, and terminates survivors in the gate's process
+group.
 
 A timeout sends `SIGTERM` to the command's process group, escalates to `SIGKILL`
 after 500 ms, awaits that process group, and records a failed gate. The runner

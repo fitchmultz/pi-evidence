@@ -253,6 +253,30 @@ test("timeout returns when an escaped descendant holds output pipes", () => {
   }
 });
 
+test("a successful gate is not delayed by a background pipe holder", () => {
+  const candidate = fixture("background", {
+    gates: [
+      {
+        id: "background",
+        cmd: `sleep 60 & echo $! > "$HOME/background.pid"; echo done; exit 0`,
+        timeout: 5,
+      },
+    ],
+    approvals: [],
+  });
+
+  const started = Date.now();
+  const run = evidence(candidate, "run");
+  assert.equal(run.status, 0, run.stderr);
+  assert.ok(Date.now() - started < 3_000, "successful gate waited for its timeout");
+  const [record] = runs(candidate);
+  assert.equal(record.results[0].exitCode, 0);
+  assert.equal(record.results[0].timedOut, false);
+  assert.match(record.results[0].stdout, /done/);
+  const backgroundPid = Number(readFileSync(join(candidate.home, "background.pid"), "utf8"));
+  assert.equal(processIsRunning(backgroundPid), false, `background process ${backgroundPid} is still alive`);
+});
+
 test("repository roots preserve trailing spaces", () => {
   const candidate = fixture(
     "space-root",
@@ -340,7 +364,7 @@ test("corrupt completed bundle data fails closed as stale", () => {
     approvals: [],
   });
   assert.equal(evidence(candidate, "run").status, 0);
-  writeFileSync(join(bundle(candidate), "runs", "corrupt.json"), "not-json\n");
+  writeFileSync(join(bundle(candidate), "runs", "000000000002.json"), "not-json\n");
   const rerun = evidence(candidate, "run");
   assert.equal(rerun.status, 2);
   assert.equal(rerun.stdout, "");
