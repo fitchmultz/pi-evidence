@@ -1,0 +1,9 @@
+{
+  "repo": "acme/widget",
+  "gates": [
+    { "id": "lint", "cmd": "npm run lint", "timeout": 120 },
+    { "id": "test", "cmd": "npm test", "timeout": 600 },
+    { "id": "build", "cmd": "npm run build", "timeout": 300 }
+  ],
+  "approvals": ["maintainer", "reviewer-panel"]
+}

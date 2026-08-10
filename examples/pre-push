@@ -1,0 +1,4 @@
+#!/bin/sh
+# .git/hooks/pre-push: refuse to push unless HEAD has green evidence.
+# Checks HEAD only; pushing other refs is not inspected.
+exec evidence check "$(git rev-parse HEAD)"

@@ -88,6 +88,9 @@ STALE 4f60b0d5e1c6a3f9b2d84a7c0e5f1b9d3a6c8e20 HEAD is 9b1c44f2…
 
 The new commit has no evidence of its own until `evidence run` runs again.
 
+See [examples/](examples/) for a multi-gate manifest, a gated release script,
+and a pre-push hook.
+
 ### Gating a release script
 
 ```sh
