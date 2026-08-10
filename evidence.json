@@ -1,0 +1,11 @@
+{
+  "repo": "fitchmultz/pi-evidence",
+  "gates": [
+    {
+      "id": "test",
+      "cmd": "npm test",
+      "timeout": 120
+    }
+  ],
+  "approvals": ["maintainer"]
+}
