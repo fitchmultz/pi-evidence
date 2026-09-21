@@ -121,6 +121,8 @@ rewritten.
 ## Develop
 
 ```sh
-npm ci
-npm test
+npm ci --ignore-scripts
+npm run check:compat
 ```
+
+`check:compat` builds and runs the existing exact-head/Git subprocess tests, including a real tarball installation with no Pi or development dependencies and execution of its installed `evidence` bin. It then checks the canonical `prepack` build and package contents. This is a standalone Node/Git CLI, not an extension: official/fork Pi host matrices do not apply. Node >=20 remains the declared floor; the process-group and shell tests require a POSIX runner.

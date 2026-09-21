@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
+const projectRoot = resolve(".");
 const cli = resolve("dist/evidence.js");
 const roots = [];
 
@@ -180,6 +181,35 @@ test("run, approve, check, append, and stale lifecycle", () => {
   result = evidence(candidate, "check", candidate.sha);
   assert.equal(result.status, 2);
   assert.match(result.stdout, /^STALE .*HEAD is /);
+});
+
+test("GitHub release tarball installs its standalone bin without Pi or dev dependencies", () => {
+  const candidate = fixture("packed", {
+    gates: [{ id: "ok", cmd: `node -e "process.stdout.write('packed-ok')"`, timeout: 5 }],
+    approvals: [],
+  });
+  const pack = exec("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", candidate.home], { cwd: projectRoot });
+  assert.equal(pack.status, 0, pack.stderr);
+  const [archive] = JSON.parse(pack.stdout);
+  assert.ok(archive.files.some(({ path }) => path === "dist/evidence.js"));
+  assert.ok(!archive.files.some(({ path }) => path.startsWith("node_modules/")));
+  const consumer = join(candidate.home, "consumer");
+  const install = exec("npm", ["install", "--prefix", consumer, "--offline", "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund", join(candidate.home, archive.filename)], {
+    env: { ...process.env, HOME: candidate.home },
+  });
+  assert.equal(install.status, 0, install.stderr);
+  const pkg = JSON.parse(readFileSync(join(consumer, "node_modules/pi-evidence/package.json"), "utf8"));
+  assert.equal(pkg.bin.evidence, "dist/evidence.js");
+  assert.deepEqual(readdirSync(join(consumer, "node_modules")).filter((name) => !name.startsWith(".")), ["pi-evidence"]);
+  const bin = join(consumer, "node_modules/.bin/evidence");
+  assert.ok(existsSync(bin), "npm must install the executable bin");
+  const options = { cwd: candidate.root, env: { ...process.env, HOME: candidate.home } };
+  const run = exec(process.execPath, [bin, "run"], options);
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout, "packed-ok");
+  const check = exec(process.execPath, [bin, "check", candidate.sha], options);
+  assert.equal(check.status, 0, check.stderr);
+  assert.match(check.stdout, /^GREEN /);
 });
 
 test("check revalidates HEAD immediately before its verdict", async () => {
